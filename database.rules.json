@@ -2,6 +2,7 @@
   "rules": {
     "falconfrost": { ".read": true, ".write": true },
     "falconfrost-practice": { ".read": true, ".write": true },
+    "falconfrost-content": { ".read": true, ".write": true },
     "$other": { ".read": false, ".write": false }
   }
 }

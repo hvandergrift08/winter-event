@@ -2,16 +2,61 @@
 (function () {
   'use strict';
 
-  const G = window.GAME;
+  const BASE = window.GAME;
   const params = new URLSearchParams(location.search);
   const PRACTICE = params.has('practice');
-  const ROOT = 'falconfrost' + (PRACTICE ? '-practice' : '');
-  const CAP = G.capMinutes * 60000;
-  const STEPS = G.steps;
-  const FINAL_IDX = STEPS.findIndex(s => s.type === 'final');
-  const FINALE_IDX = STEPS.findIndex(s => s.finale);
-  const LAST_PLAYABLE = FINAL_IDX >= 0 ? FINAL_IDX : STEPS.length - 1;
+  const PREVIEW = params.has('preview');
+  const EMBED = PREVIEW && params.has('embed');
+  const ROOT = PREVIEW ? 'falconfrost-preview' + (EMBED ? '-embed' : '') : 'falconfrost' + (PRACTICE ? '-practice' : '');
+  const CONTENT_ROOT = 'falconfrost-content';
   const ONLINE_MS = 35000;
+
+  /* ---------------- content ----------------
+     content.js is the starting point and the backup. Anything saved in the
+     game builder is stored in the database and takes priority. */
+  let G, CAP, STEPS, FINAL_IDX, FINALE_IDX, LAST_PLAYABLE, teamById = {}, hrByRoom = {};
+  let contentFrozen = false, pendingContent = null;
+  const contentListeners = [];
+  const toArr = v => Array.isArray(v) ? v.filter(x => x != null) : (v && typeof v === 'object' ? Object.keys(v).sort((a, b) => a - b).map(k => v[k]).filter(x => x != null) : []);
+  function normalizeContent(c) {
+    if (!c || !c.steps) return null;
+    const steps = toArr(c.steps).map(st => {
+      const o = Object.assign({}, st);
+      if (o.type !== 'video') o.hints = toArr(o.hints).filter(h => h && typeof h === 'object');
+      if (o.type === 'mission') o.code = Object.assign({ answers: [] }, o.code || {}, { answers: toArr(o.code && o.code.answers) });
+      return o;
+    });
+    return { settings: c.settings || {}, steps };
+  }
+  function buildGame(dbc) {
+    const g = JSON.parse(JSON.stringify(BASE));
+    if (dbc) {
+      const st = dbc.settings || {};
+      ['title', 'capMinutes', 'defaultHintPenaltyMinutes', 'startCountdownSeconds'].forEach(k => { if (st[k] != null && st[k] !== '') g[k] = st[k]; });
+      if (st.pins) g.pins = Object.assign({}, g.pins, st.pins);
+      if (dbc.steps && dbc.steps.length) g.steps = dbc.steps;
+    }
+    if (PREVIEW) g.homerooms = g.homerooms.concat([{ room: 'P', teacher: 'Preview room', team: g.teams[0].id }]);
+    return g;
+  }
+  function applyContent(g) {
+    G = g; CAP = Number(G.capMinutes) * 60000; STEPS = G.steps;
+    FINAL_IDX = STEPS.findIndex(s => s.type === 'final');
+    FINALE_IDX = STEPS.findIndex(s => s.finale);
+    LAST_PLAYABLE = FINAL_IDX >= 0 ? FINAL_IDX : STEPS.length - 1;
+    teamById = Object.fromEntries(G.teams.map(t => [t.id, t]));
+    hrByRoom = Object.fromEntries(G.homerooms.map(h => [h.room, h]));
+  }
+  function setFrozen(f) {
+    contentFrozen = f;
+    if (!f && pendingContent) { applyContent(pendingContent); pendingContent = null; contentListeners.forEach(fn => fn()); }
+  }
+  function codeMatches(step, input) {
+    let n = norm(input);
+    const pre = norm((step.code && step.code.prefix) || '');
+    if (pre && n.startsWith(pre) && n !== pre) n = n.slice(pre.length);
+    return !!n && ((step.code && step.code.answers) || []).some(a => norm(a) === n);
+  }
 
   /* ---------------- helpers ---------------- */
   const $ = (s, el = document) => el.querySelector(s);
@@ -35,15 +80,13 @@
     return s * 1000;
   }
   const ordinal = n => n + (['th', 'st', 'nd', 'rd'][(n % 100 - 20) % 10] || ['th', 'st', 'nd', 'rd'][n % 100] || 'th');
-  const teamById = Object.fromEntries(G.teams.map(t => [t.id, t]));
-  const hrByRoom = Object.fromEntries(G.homerooms.map(h => [h.room, h]));
   const roomName = id => { const h = hrByRoom[id]; return h ? 'Room ' + h.room + ' – ' + h.teacher : 'Room ' + id; };
   const sortedRooms = () => G.homerooms.slice().sort((a, b) => Number(a.room) - Number(b.room) || a.room.localeCompare(b.room));
   const CLIENT = store.get('ff-client') || (() => { const c = newId(); store.set('ff-client', c); return c; })();
 
   /* ---------------- database adapters ---------------- */
-  function makeFirebaseDB() {
-    firebase.initializeApp(window.FIREBASE_CONFIG);
+  function makeFirebaseDB(ROOT) {
+    if (!firebase.apps.length) firebase.initializeApp(window.FIREBASE_CONFIG);
     const db = firebase.database();
     let offset = 0, connected = false;
     const connCbs = [];
@@ -64,7 +107,7 @@
     };
   }
 
-  function makeLocalDB() {
+  function makeLocalDB(ROOT) {
     const KEY = 'ff-demo-db-' + ROOT;
     const load = () => { try { return JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) { return {}; } };
     let tree = load();
@@ -190,7 +233,9 @@
     });
   }
   function modeBanner() {
-    const txt = (DB.mode === 'demo' ? 'Demo mode: syncs between tabs in this browser only' : '') + (PRACTICE ? (DB.mode === 'demo' ? '. ' : '') + 'Practice run' : '');
+    if (EMBED) return;
+    const txt = PREVIEW ? 'Preview: nothing here affects the real game'
+      : (DB.mode === 'demo' ? 'Demo mode: syncs between tabs in this browser only' : '') + (PRACTICE ? (DB.mode === 'demo' ? '. ' : '') + 'Practice run' : '');
     if (!txt) return;
     const b = document.createElement('div'); b.className = 'mode-banner'; b.textContent = txt; document.body.appendChild(b);
   }
@@ -283,7 +328,73 @@
     game = store.get('ff-cache-game-' + ROOT);
 
     const pinOk = () => store.get('ff-tpin') === G.pins.teacher;
-    if (roomId && hrByRoom[roomId] && pinOk()) startSession(roomId); else { roomId = null; render(true); }
+    contentListeners.push(() => { viewKey = ''; if (PREVIEW && !EMBED) drawPreviewTools(); });
+    if (PREVIEW) previewBoot();
+    else if (roomId && hrByRoom[roomId] && pinOk()) startSession(roomId); else { roomId = null; render(true); }
+
+    /* ---- preview mode: a private copy of the game for testing ---- */
+    function previewSet(n, upd, game0) {
+      const now = DB.now();
+      n = Math.max(0, Math.min(n, STEPS.length - 1));
+      if (n === FINALE_IDX) {
+        const runId = (upd.game && upd.game.runId) || (game0 && game0.runId) || '';
+        const start = (upd.game && upd.game.startAt) || (game0 && game0.startAt) || now;
+        const el = Math.max(1000, now - start);
+        upd['rooms/P/finish'] = { elapsed: el, by: 'preview', at: now };
+        store.set('ff-done-' + ROOT + '-P', { sig: runId + '|' + now, stage: 'finale' });
+      } else {
+        upd['rooms/P/finish'] = null;
+        upd['rooms/P/progress/step'] = Math.min(n, LAST_PLAYABLE);
+        upd['rooms/P/progress/stepAt'] = now;
+      }
+    }
+    async function previewBoot() {
+      const now = DB.now();
+      const g = await DB.once('game');
+      const upd = { 'rooms/P/claim': { client: CLIENT, at: now } };
+      if (!g || !g.startAt || (EMBED && params.get('step') != null)) upd.game = { status: 'running', startAt: now - 1000, pausedTotal: 0, runId: newId() };
+      const sp = params.get('step');
+      if (sp != null && !isNaN(Number(sp))) previewSet(Number(sp), upd, g);
+      await DB.update('', upd);
+      startSession('P');
+      if (!EMBED) drawPreviewTools();
+    }
+    let pvHidden = false, pvKey = '';
+    function drawPreviewTools(force) {
+      let el = $('#pv-tools');
+      if (!el) { el = document.createElement('div'); el.id = 'pv-tools'; document.body.appendChild(el); force = true; }
+      const i = (room && room.finish) ? FINALE_IDX : stepOf(room);
+      const st = STEPS[i] || {};
+      const key = pvHidden + '|' + i + '|' + !!(room && room.finish) + '|' + JSON.stringify(st.code || '') + STEPS.length;
+      if (!force && key === pvKey) return;
+      pvKey = key;
+      if (pvHidden) { el.className = 'pv-tools mini'; el.innerHTML = '<button class="btn sm" data-pv="show">Preview tools</button>'; }
+      else {
+        const code = st.type === 'mission' ? ((st.code && st.code.answers && st.code.answers.length) ? esc(st.code.answers.join('  or  ')) : '<span style="color:#ffb4ac">No codeword set</span>') : '<span class="muted">None on this step</span>';
+        el.className = 'pv-tools';
+        el.innerHTML = '<div class="pv-head"><strong>Preview tools</strong><button class="btn ghost sm" data-pv="hide">Hide</button></div>' +
+          '<label for="pv-step">Jump to</label><select id="pv-step" data-pv-step>' + STEPS.map((s2, n) => '<option value="' + n + '"' + (n === i ? ' selected' : '') + '>' + esc(s2.label) + '</option>').join('') + '</select>' +
+          '<div class="pv-code">Codeword: <strong>' + code + '</strong></div>' +
+          '<div class="pv-btns">' + (room && room.finish ? '<button class="btn sm" data-pv="unlib">Undo library check-in</button>' : '<button class="btn sm" data-pv="lib">Simulate library check-in</button>') +
+          '<button class="btn sm" data-pv="timeup">Test time\'s up</button><button class="btn sm" data-pv="restart">Restart preview</button></div>';
+      }
+      el.onclick = async e => {
+        const b = e.target.closest('[data-pv]'); if (!b) return;
+        const a = b.dataset.pv, now = DB.now();
+        if (a === 'hide') pvHidden = true;
+        if (a === 'show') pvHidden = false;
+        if (a === 'lib') DB.set('rooms/P/finish', { elapsed: gameElapsed(game, now), by: 'preview', at: now });
+        if (a === 'unlib') DB.remove('rooms/P/finish');
+        if (a === 'timeup') DB.update('game', { status: 'running', startAt: now - CAP - 1000, pausedTotal: 0, pausedAt: null });
+        if (a === 'restart') {
+          store.del('ff-done-' + ROOT + '-P');
+          DB.update('', { game: { status: 'running', startAt: now - 1000, pausedTotal: 0, runId: newId() }, 'rooms/P/progress': null, 'rooms/P/finish': null, 'rooms/P/credits': null });
+        }
+        setTimeout(() => drawPreviewTools(true), 50);
+      };
+      const sel = $('[data-pv-step]', el);
+      if (sel) sel.onchange = () => { const upd = {}; previewSet(Number(sel.value), upd, game); DB.update('', upd); setTimeout(() => drawPreviewTools(true), 50); };
+    }
 
     function startSession(id) {
       roomId = id;
@@ -293,7 +404,7 @@
       unsubRoom = DB.on('rooms/' + id, v => { room = v; store.set('ff-cache-room-' + ROOT + '-' + id, v); });
       const beat = () => DB.update('rooms/' + id + '/presence', { lastSeen: DB.now(), client: CLIENT });
       beat(); clearInterval(hb); hb = setInterval(beat, 10000);
-      runVideoCheck();
+      if (!EMBED) runVideoCheck();
       render(true);
     }
     async function runVideoCheck() {
@@ -574,10 +685,7 @@
           const check = () => {
             const val = inp.value;
             if (!norm(val)) { fb.textContent = 'Type the codeword first.'; return; }
-            let n = norm(val);
-            const pre = norm(prefix || '');
-            if (pre && n.startsWith(pre) && n !== pre) n = n.slice(pre.length);
-            const ok = (st.code.answers || []).some(a => norm(a) === n);
+            const ok = codeMatches(st, val);
             const attempts = Object.assign({}, room && room.progress && room.progress.attempts);
             if (!ok) {
               attempts[st.id] = (attempts[st.id] || 0) + 1;
@@ -645,6 +753,9 @@
     let pauseEl = null, lastBoard = 0;
     function tick() {
       render(false);
+      const md = currentMode();
+      if (!PREVIEW) setFrozen(md === 'countdown' || md === 'play' || md === 'done');
+      else if (!EMBED && roomId) drawPreviewTools();
       const now = DB.now();
       const clock = $('[data-clock]');
       if (clock) {
@@ -787,7 +898,9 @@
         (status === 'lobby' ? '<button class="btn primary big" data-a="start">Start all rooms</button>' : '') +
         (status === 'running' ? '<button class="btn big" data-a="pause">Pause all</button>' : '') +
         (status === 'paused' ? '<button class="btn primary big" data-a="resume">Resume all</button>' : '') +
-        '<a class="btn" href="#board' + (PRACTICE ? '' : '') + '" target="_blank" rel="noopener">Open leaderboard</a>' +
+        '<a class="btn" href="#builder">Game builder</a>' +
+        '<a class="btn" href="?preview" target="_blank" rel="noopener">Preview</a>' +
+        '<a class="btn" href="#board" target="_blank" rel="noopener">Open leaderboard</a>' +
         '<a class="btn" href="#library" target="_blank" rel="noopener">Library screen</a>' +
         '<button class="btn danger" data-a="reset">Reset game</button>';
 
@@ -937,24 +1050,377 @@
   }
 
   /* =====================================================================
+     GAME BUILDER  (#builder)
+     ===================================================================== */
+  function builderApp() {
+    const app = $('#app');
+    const clone = v => JSON.parse(JSON.stringify(v));
+    const settingsOf = g => ({ title: g.title, pins: Object.assign({}, g.pins), capMinutes: g.capMinutes, defaultHintPenaltyMinutes: g.defaultHintPenaltyMinutes, startCountdownSeconds: g.startCountdownSeconds });
+    let draft = { settings: settingsOf(G), steps: clone(G.steps) };
+    let sel = 0, tab = 'steps', saveTimer = null, saveState = 'idle', previewSrc = '';
+    const isLocked = st => st.type === 'final' || st.finale;
+    const finalIdx = () => draft.steps.findIndex(s => s.type === 'final');
+
+    // canonical form for "does the backup file match?"
+    function canon(v) {
+      if (Array.isArray(v)) { const a = v.map(canon).filter(x => x !== undefined); return a.length ? a : undefined; }
+      if (v && typeof v === 'object') { const o = {}; Object.keys(v).sort().forEach(k => { const c = canon(v[k]); if (c !== undefined) o[k] = c; }); return Object.keys(o).length ? o : undefined; }
+      if (v === '' || v == null) return undefined;
+      return typeof v === 'number' ? String(v) : v;
+    }
+    const baseDraft = () => ({ settings: settingsOf(BASE), steps: clone(BASE.steps) });
+    const matchesFile = () => JSON.stringify(canon(draft)) === JSON.stringify(canon(baseDraft()));
+
+    function save() {
+      saveState = 'pending'; drawStatus();
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => {
+        const payload = JSON.parse(JSON.stringify({ settings: draft.settings, steps: draft.steps, updatedAt: CDB.now() }));
+        const p = CDB.set('content', payload);
+        saveState = 'saving'; drawStatus();
+        Promise.resolve(p).then(() => { saveState = 'saved'; drawStatus(); }).catch(() => { saveState = 'error'; drawStatus(); });
+      }, 600);
+    }
+    function drawStatus() {
+      const el = $('[data-status]'); if (!el) return;
+      const txt = { idle: 'All changes saved', pending: 'Saving…', saving: 'Saving…', saved: 'All changes saved', error: 'Couldn\'t save. Check the connection.' }[saveState];
+      el.innerHTML = '<span class="dot ' + (saveState === 'error' ? 'off' : (saveState === 'saved' || saveState === 'idle' ? '' : 'warn')) + '"></span>' + esc(txt) +
+        (DB.mode === 'demo' ? '<span class="muted"> (demo: this browser only)</span>' : '') +
+        '<span class="bld-file">' + (matchesFile() ? 'Backup content.js matches' : '<button class="btn ghost sm" data-export>Backup content.js is out of date. Download a new one</button>') + '</span>';
+      const ex = $('[data-export]', el); if (ex) ex.onclick = exportFile;
+    }
+    window.addEventListener('beforeunload', e => { if (saveState === 'pending' || saveState === 'saving') { e.preventDefault(); e.returnValue = ''; } });
+
+    function exportFile() {
+      const g = Object.assign({}, BASE, draft.settings, { pins: draft.settings.pins, steps: draft.steps });
+      delete g.homerooms; delete g.teams;
+      const g2 = Object.assign({ title: g.title, pins: g.pins, capMinutes: Number(g.capMinutes), defaultHintPenaltyMinutes: Number(g.defaultHintPenaltyMinutes), startCountdownSeconds: Number(g.startCountdownSeconds), teams: BASE.teams, homerooms: BASE.homerooms, steps: draft.steps });
+      const txt = '/* Operation: Falcon Frost game content.\n   Exported from the game builder on ' + new Date().toLocaleString() + '.\n   Upload this file to GitHub to replace content.js. It is the backup the game\n   uses if a computer can\'t load your latest edits from Firebase. */\n\nwindow.GAME = ' + JSON.stringify(g2, null, 2) + ';\n';
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([txt], { type: 'text/javascript' }));
+      a.download = 'content.js'; document.body.appendChild(a); a.click(); a.remove();
+    }
+
+    /* ---- shell ---- */
+    app.innerHTML = '<div class="bld"><header class="bld-head"><div><h1>Game builder</h1><div class="bld-status" data-status></div></div>' +
+      '<nav class="bld-tabs" role="tablist">' + [['steps', 'Steps'], ['sheet', 'Run sheet'], ['settings', 'Settings']].map(([k, l]) => '<button class="btn" role="tab" data-tab="' + k + '">' + l + '</button>').join('') + '</nav>' +
+      '<div class="bld-links"><a class="btn primary" href="?preview" target="_blank" rel="noopener">Play the full preview</a><a class="btn" href="#control">Control panel</a></div></header>' +
+      '<div data-body></div></div>';
+    $$('[data-tab]').forEach(b => b.onclick = () => { tab = b.dataset.tab; drawTab(); });
+    drawStatus();
+    drawTab();
+
+    function drawTab() {
+      $$('[data-tab]').forEach(b => { b.classList.toggle('primary', b.dataset.tab === tab); b.setAttribute('aria-selected', b.dataset.tab === tab); });
+      if (tab === 'steps') drawSteps();
+      else if (tab === 'sheet') drawSheet();
+      else drawSettings();
+    }
+
+    /* ---- steps tab ---- */
+    function drawSteps() {
+      previewSrc = '';
+      $('[data-body]').innerHTML = '<div class="bld-steps"><aside class="bld-list"><ol data-list></ol>' +
+        '<div class="bld-add"><button class="btn sm" data-add="video">Add video</button><button class="btn sm" data-add="mission">Add mission</button></div>' +
+        '<p class="muted small">New steps go right after the selected one.</p></aside>' +
+        '<section class="bld-editor" data-editor></section>' +
+        '<section class="bld-preview"><div class="pv-frame" data-frame><iframe title="Step preview" data-iframe></iframe></div>' +
+        '<p class="muted small">This is how the selected step looks on the classroom TV. Your edits appear here within a second or two. Codewords and hints work in here too.</p></section></div>';
+      $$('[data-add]').forEach(b => b.onclick = () => addStep(b.dataset.add));
+      const frame = $('[data-frame]'), ifr = $('[data-iframe]');
+      const fit = () => { const w = frame.clientWidth; ifr.style.transform = 'scale(' + (w / 1600) + ')'; frame.style.height = (900 * w / 1600) + 'px'; };
+      if ('ResizeObserver' in window) new ResizeObserver(fit).observe(frame); fit();
+      drawList(); drawEditor(); updatePreview();
+    }
+    function updatePreview() {
+      const ifr = $('[data-iframe]'); if (!ifr) return;
+      const src = location.pathname + '?preview&embed&step=' + sel;
+      if (src !== previewSrc) { previewSrc = src; ifr.src = src; }
+    }
+    function stepMeta(st) {
+      if (st.type === 'video') return st.youtubeId ? 'Video added' : '<span class="warn-txt">No video yet</span>';
+      if (st.type === 'final') return 'Ends at library check-in';
+      const a = (st.code && st.code.answers) || [];
+      const h = (st.hints || []).filter(x => x && x.text).length;
+      return (a.length ? 'Code: ' + esc(a[0]) : '<span class="warn-txt">No codeword</span>') + (h ? ', ' + h + ' hint' + (h > 1 ? 's' : '') : '');
+    }
+    function drawList() {
+      $('[data-list]').innerHTML = draft.steps.map((st, i) =>
+        '<li><button class="bld-item' + (i === sel ? ' on' : '') + (st.type === 'video' ? ' vid' : '') + '" data-sel="' + i + '">' +
+        '<span class="bld-kind">' + (st.type === 'video' ? 'Video' : 'Mission') + '</span>' +
+        '<span class="bld-name">' + esc(st.label || st.title || 'Untitled') + '</span><span class="bld-meta">' + stepMeta(st) + '</span></button></li>').join('');
+      $$('[data-sel]').forEach(b => b.onclick = () => { sel = Number(b.dataset.sel); drawList(); drawEditor(); updatePreview(); });
+    }
+    function addStep(kind) {
+      const fi = finalIdx();
+      let at = sel + 1;
+      if (fi >= 0 && at > fi) at = fi;
+      const id = 's' + newId();
+      const st = kind === 'video'
+        ? { id, type: 'video', label: 'New video', title: 'New video', youtubeId: '', recap: '' }
+        : { id, type: 'mission', label: 'New mission', title: 'New mission', body: '<p>Write the instructions here.</p>', code: { answers: [] }, hints: [] };
+      draft.steps.splice(at, 0, st);
+      sel = at; save(); drawList(); drawEditor(); updatePreview();
+    }
+    function moveStep(d) {
+      const j = sel + d, fi = finalIdx();
+      if (j < 0 || j >= draft.steps.length || isLocked(draft.steps[sel]) || (fi >= 0 && j >= fi)) return;
+      const [x] = draft.steps.splice(sel, 1); draft.steps.splice(j, 0, x);
+      sel = j; save(); drawList(); drawEditor(); updatePreview();
+    }
+    async function deleteStep() {
+      const st = draft.steps[sel];
+      if (isLocked(st)) return;
+      if (!await confirmBox({ title: 'Delete "' + (st.label || st.title) + '"?', text: 'This removes the step from the game for everyone.', ok: 'Delete step', danger: true })) return;
+      draft.steps.splice(sel, 1);
+      sel = Math.max(0, sel - 1); save(); drawList(); drawEditor(); updatePreview();
+    }
+
+    function field(label, key, value, opts = {}) {
+      const id = 'f-' + key;
+      return '<div class="bld-field"><label for="' + id + '">' + esc(label) + '</label>' +
+        (opts.area ? '<textarea id="' + id + '" data-f="' + key + '" rows="' + (opts.rows || 3) + '" placeholder="' + esc(opts.ph || '') + '">' + esc(value || '') + '</textarea>'
+          : '<input id="' + id + '" type="text" data-f="' + key + '" value="' + esc(value || '') + '" placeholder="' + esc(opts.ph || '') + '">') +
+        (opts.help ? '<p class="help">' + opts.help + '</p>' : '') + '</div>';
+    }
+    function ytId(v) {
+      v = (v || '').trim();
+      const m = v.match(/(?:v=|youtu\.be\/|shorts\/|embed\/|live\/)([A-Za-z0-9_-]{11})/);
+      if (m) return m[1];
+      return /^[A-Za-z0-9_-]{11}$/.test(v) ? v : null;
+    }
+
+    function drawEditor() {
+      const st = draft.steps[sel], ed = $('[data-editor]');
+      if (!st) { ed.innerHTML = ''; return; }
+      const fi = finalIdx();
+      const canUp = !isLocked(st) && sel > 0, canDown = !isLocked(st) && sel < (fi >= 0 ? fi - 1 : draft.steps.length - 1);
+      let h = '<div class="bld-ed-head"><h2>' + esc(st.label || 'Untitled') + '</h2><div class="bld-ed-btns">' +
+        '<button class="btn sm" data-mv="-1"' + (canUp ? '' : ' disabled') + '>Move up</button>' +
+        '<button class="btn sm" data-mv="1"' + (canDown ? '' : ' disabled') + '>Move down</button>' +
+        (isLocked(st) ? '' : '<button class="btn sm danger" data-del>Delete</button>') + '</div></div>';
+      if (st.type === 'final') h += '<p class="note">This is the last mission. It has no codeword: the room\'s clock stops when the library checks them in. It always stays just before the final video.</p>';
+      if (st.finale) h += '<p class="note">This video unlocks after the library check-in, or when time runs out. It always stays last.</p>';
+      h += field('Name in the control panel and run sheet', 'label', st.label, { help: 'Short, for you. Teachers don\'t see this.' });
+      h += field('Title on the TV', 'title', st.title);
+      if (st.type === 'video') {
+        h += field('YouTube link', 'youtube', st.youtubeId ? 'https://www.youtube.com/watch?v=' + st.youtubeId : '', { ph: 'Paste the video link', help: 'Upload as Unlisted with "Allow embedding" on.' });
+        h += '<div data-yt></div>';
+        h += field('Recap', 'recap', st.recap, { area: true, rows: 4, help: 'Shown if the video won\'t play or hasn\'t been added. Include anything students must know.' });
+      } else {
+        h += '<div class="bld-field"><label>Instructions</label><div class="rte-bar">' +
+          '<button class="btn sm" data-cmd="bold" title="Bold"><strong>B</strong></button>' +
+          '<button class="btn sm" data-cmd="insertOrderedList">Numbered list</button>' +
+          '<button class="btn sm" data-cmd="insertUnorderedList">Bullets</button>' +
+          '<button class="btn sm" data-cmd="callout">Highlight box</button>' +
+          '<button class="btn sm" data-cmd="normal">Plain text</button></div>' +
+          '<div class="rte mission-body" contenteditable="true" data-rte>' + (st.body || '') + '</div>' +
+          '<p class="help">Pasted text comes in plain. Use the buttons to format it.</p></div>';
+        if (st.type === 'mission') {
+          h += '<div class="bld-section"><h3>Codeword</h3>' +
+            field('Accepted answers, one per line', 'answers', ((st.code && st.code.answers) || []).join('\n'), { area: true, rows: 3, help: 'Capitalization, spaces and punctuation don\'t matter. Add a line for any other spelling you\'ll accept.' }) +
+            field('Sentence starter (optional)', 'prefix', st.code && st.code.prefix, { ph: 'e.g. Professor Frost is', help: 'Shown above the codeword box. Teachers can type just the answer or the whole sentence.' }) +
+            '<div class="bld-field"><label for="f-test">Test a codeword</label><input id="f-test" type="text" data-test placeholder="Type what a teacher might enter"><p class="help" data-testres></p></div></div>';
+        }
+        h += '<div class="bld-section"><h3>Hints</h3><p class="help">Hints unlock in order. Leave minutes blank to use the default (' + esc(draft.settings.defaultHintPenaltyMinutes) + ' min).</p><div data-hints></div><button class="btn sm" data-addhint>Add a hint</button></div>';
+      }
+      ed.innerHTML = h;
+
+      $$('[data-mv]', ed).forEach(b => b.onclick = () => moveStep(Number(b.dataset.mv)));
+      const del = $('[data-del]', ed); if (del) del.onclick = deleteStep;
+      $$('[data-f]', ed).forEach(inp => inp.addEventListener('input', () => onField(st, inp)));
+      if (st.type === 'video') drawYT(st);
+      const rte = $('[data-rte]', ed);
+      if (rte) setupRTE(rte, st);
+      const test = $('[data-test]', ed);
+      if (test) test.addEventListener('input', () => drawTest(st));
+      if (st.type !== 'video') { drawHints(st); $('[data-addhint]', ed).onclick = () => { st.hints = st.hints || []; st.hints.push({ text: '' }); save(); drawHints(st); drawList(); const t = $$('[data-hint-text]', ed).pop(); if (t) t.focus(); }; }
+    }
+    function onField(st, inp) {
+      const k = inp.dataset.f, v = inp.value;
+      if (k === 'label') { st.label = v; $('.bld-ed-head h2').textContent = v || 'Untitled'; }
+      else if (k === 'title') st.title = v;
+      else if (k === 'recap') st.recap = v;
+      else if (k === 'youtube') { const id = ytId(v); if (!v.trim()) st.youtubeId = ''; else if (id) st.youtubeId = id; drawYT(st, v.trim() && !id); }
+      else if (k === 'answers') { st.code = st.code || {}; st.code.answers = v.split('\n').map(x => x.trim()).filter(Boolean); drawTest(st); }
+      else if (k === 'prefix') { st.code = st.code || {}; st.code.prefix = v.trim(); drawTest(st); }
+      save(); drawList();
+    }
+    function drawYT(st, bad) {
+      const el = $('[data-yt]'); if (!el) return;
+      el.innerHTML = bad ? '<p class="help warn-txt">That doesn\'t look like a YouTube link. Copy the address from the video page or the Share button.</p>'
+        : st.youtubeId ? '<div class="yt-thumb"><img alt="" src="https://i.ytimg.com/vi/' + encodeURIComponent(st.youtubeId) + '/mqdefault.jpg"><span class="help">Video ID ' + esc(st.youtubeId) + '</span></div>'
+        : '<p class="help">No video yet. The recap will show in its place.</p>';
+    }
+    function drawTest(st) {
+      const t = $('[data-test]'), r = $('[data-testres]'); if (!t || !r) return;
+      if (!t.value.trim()) { r.textContent = ''; return; }
+      const ok = codeMatches(st, t.value);
+      r.innerHTML = ok ? '<span style="color:var(--ok)">Accepted. This would unlock the next step.</span>' : '<span class="warn-txt">Not accepted.</span>';
+    }
+    function drawHints(st) {
+      const el = $('[data-hints]'); if (!el) return;
+      const hs = st.hints || [];
+      el.innerHTML = hs.length ? hs.map((hn, n) => '<div class="hint-ed"><div class="hint-ed-top"><strong>Hint ' + (n + 1) + '</strong>' +
+        '<label class="mins">Minutes <input type="number" min="0" step="0.5" data-hint-min="' + n + '" value="' + (hn.penaltyMinutes != null ? esc(hn.penaltyMinutes) : '') + '" placeholder="' + esc(draft.settings.defaultHintPenaltyMinutes) + '"></label>' +
+        '<button class="btn sm" data-hmv="' + n + ':-1"' + (n ? '' : ' disabled') + '>Up</button><button class="btn sm" data-hmv="' + n + ':1"' + (n < hs.length - 1 ? '' : ' disabled') + '>Down</button><button class="btn sm danger" data-hdel="' + n + '">Remove</button></div>' +
+        '<textarea rows="2" data-hint-text="' + n + '" placeholder="What the hint says">' + esc(hn.text || '') + '</textarea></div>').join('')
+        : '<p class="muted small">No hints yet.</p>';
+      $$('[data-hint-text]', el).forEach(t => t.addEventListener('input', () => { hs[Number(t.dataset.hintText)].text = t.value; save(); drawList(); }));
+      $$('[data-hint-min]', el).forEach(t => t.addEventListener('input', () => { const h = hs[Number(t.dataset.hintMin)]; if (t.value === '') delete h.penaltyMinutes; else if (!isNaN(Number(t.value))) h.penaltyMinutes = Number(t.value); save(); }));
+      $$('[data-hmv]', el).forEach(b => b.onclick = () => { const [n, d] = b.dataset.hmv.split(':').map(Number); const [x] = hs.splice(n, 1); hs.splice(n + d, 0, x); save(); drawHints(st); });
+      $$('[data-hdel]', el).forEach(b => b.onclick = () => { hs.splice(Number(b.dataset.hdel), 1); save(); drawHints(st); drawList(); });
+    }
+
+    /* ---- simple rich text editor ---- */
+    function sanitize(html) {
+      const src = document.createElement('div'); src.innerHTML = html;
+      const out = document.createElement('div');
+      const map = { b: 'strong', i: 'em', div: 'p', h1: 'p', h2: 'p', h3: 'p', h4: 'p' };
+      const allowed = ['p', 'ol', 'ul', 'li', 'strong', 'em', 'br'];
+      (function walk(node, parent) {
+        Array.from(node.childNodes).forEach(ch => {
+          if (ch.nodeType === 3) { parent.appendChild(document.createTextNode(ch.textContent)); return; }
+          if (ch.nodeType !== 1) return;
+          let tag = ch.tagName.toLowerCase(); tag = map[tag] || tag;
+          if (allowed.includes(tag)) {
+            if (tag === 'p' && parent.tagName === 'P') { walk(ch, parent); return; }
+            const el = document.createElement(tag);
+            if (tag === 'p' && ch.classList.contains('callout')) el.className = 'callout';
+            parent.appendChild(el); walk(ch, el);
+          } else walk(ch, parent);
+        });
+      })(src, out);
+      // wrap loose inline content at the top level in paragraphs
+      const final = document.createElement('div'); let cur = null;
+      Array.from(out.childNodes).forEach(n => {
+        const block = n.nodeType === 1 && ['P', 'OL', 'UL'].includes(n.tagName);
+        if (block) { cur = null; final.appendChild(n); }
+        else { if (n.nodeType === 3 && !n.textContent.trim() && !cur) return; if (!cur) { cur = document.createElement('p'); final.appendChild(cur); } cur.appendChild(n); }
+      });
+      $$('p', final).forEach(p => { if (!p.textContent.trim()) p.remove(); });
+      return final.innerHTML;
+    }
+    function setupRTE(rte, st) {
+      try { document.execCommand('defaultParagraphSeparator', false, 'p'); } catch (e) { }
+      const sync = () => { st.body = sanitize(rte.innerHTML); save(); };
+      rte.addEventListener('input', sync);
+      rte.addEventListener('blur', () => { const clean = sanitize(rte.innerHTML); if (clean !== rte.innerHTML) rte.innerHTML = clean; });
+      rte.addEventListener('paste', e => {
+        e.preventDefault();
+        const text = (e.clipboardData || window.clipboardData).getData('text/plain');
+        const lines = text.split(/\r?\n/).filter(l => l.trim());
+        if (lines.length <= 1) document.execCommand('insertText', false, text.trim());
+        else document.execCommand('insertHTML', false, lines.map(l => '<p>' + esc(l.trim()) + '</p>').join(''));
+      });
+      $$('[data-cmd]').forEach(b => {
+        b.addEventListener('mousedown', e => e.preventDefault()); // keep the text selection
+        b.onclick = () => {
+          rte.focus();
+          const c = b.dataset.cmd;
+          if (c === 'callout' || c === 'normal') {
+            document.execCommand('formatBlock', false, 'p');
+            const s2 = window.getSelection(); let n = s2 && s2.anchorNode;
+            if (n && n.nodeType === 3) n = n.parentElement;
+            const blk = n && n.closest ? n.closest('p') : null;
+            if (blk && rte.contains(blk)) { if (c === 'callout') blk.classList.toggle('callout'); else blk.classList.remove('callout'); }
+          } else document.execCommand(c, false, null);
+          sync();
+        };
+      });
+    }
+
+    /* ---- run sheet tab ---- */
+    function drawSheet() {
+      const issues = [];
+      draft.steps.forEach(st => {
+        if (st.type === 'mission' && !((st.code && st.code.answers) || []).length) issues.push(esc(st.label) + ' has no codeword, so rooms can\'t get past it.');
+        if (st.type === 'video' && !st.youtubeId) issues.push(esc(st.label) + ' has no video yet (the recap will show instead).');
+      });
+      const rows = draft.steps.map((st, i) => {
+        const hs = (st.hints || []).filter(h => h && h.text);
+        const hintTxt = st.type === 'video' ? '' : (hs.length ? hs.map((h, n) => (n + 1) + '. ' + esc(h.text) + ' <span class="muted">(+' + esc(h.penaltyMinutes != null ? h.penaltyMinutes : draft.settings.defaultHintPenaltyMinutes) + ' min)</span>').join('<br>') : '<span class="muted">None</span>');
+        const code = st.type === 'mission' ? (((st.code && st.code.answers) || []).length ? (st.code.prefix ? '<span class="muted">' + esc(st.code.prefix) + '…</span> ' : '') + '<strong>' + esc(st.code.answers[0]) + '</strong>' + (st.code.answers.length > 1 ? '<br><span class="muted">also: ' + esc(st.code.answers.slice(1).join(', ')) + '</span>' : '') : '<span class="warn-txt">Missing</span>')
+          : st.type === 'final' ? 'Library check-in' : '';
+        const what = st.type === 'video' ? (st.youtubeId ? 'Video' : 'Video <span class="warn-txt">(not added)</span>') : 'Mission';
+        return '<tr><td>' + (i + 1) + '</td><td>' + what + '</td><td><strong>' + esc(st.label) + '</strong><br><span class="muted">' + esc(st.title) + '</span></td><td>' + code + '</td><td>' + hintTxt + '</td></tr>';
+      }).join('');
+      $('[data-body]').innerHTML = '<div class="bld-sheet"><div class="bld-sheet-head"><div><h2>Run sheet</h2><p class="muted">Every step in order with its codeword and hints. Print it for yourself and the ASB helpers. Keep it away from students.</p></div><button class="btn primary" data-print>Print</button></div>' +
+        (issues.length ? '<div class="issues"><strong>Before game day</strong><ul>' + issues.map(x => '<li>' + x + '</li>').join('') + '</ul></div>' : '<div class="issues ok">Every mission has a codeword and every video is added.</div>') +
+        '<div style="overflow-x:auto"><table class="sheet"><thead><tr><th>#</th><th>Type</th><th>Step</th><th>Codeword</th><th>Hints</th></tr></thead><tbody>' + rows + '</tbody></table></div>' +
+        '<p class="muted small">Scoring: final time is the mission clock at library check-in plus hint penalties. Anything over ' + esc(draft.settings.capMinutes) + ':00 counts as ' + esc(draft.settings.capMinutes) + ':00.</p></div>';
+      $('[data-print]').onclick = () => window.print();
+    }
+
+    /* ---- settings tab ---- */
+    function drawSettings() {
+      const s = draft.settings;
+      $('[data-body]').innerHTML = '<div class="bld-settings">' +
+        '<section class="panel"><h2>PINs</h2><p class="muted">Each browser remembers a PIN after it\'s entered once. If you change one, those screens will ask for the new PIN.</p>' +
+        sField('Teacher screens', 'pins.teacher', s.pins.teacher) + sField('Control panel, builder and preview', 'pins.control', s.pins.control) + sField('Library check-in', 'pins.library', s.pins.library) + '</section>' +
+        '<section class="panel"><h2>Game rules</h2>' + sField('Game title', 'title', s.title) +
+        sField('Time cap (minutes)', 'capMinutes', s.capMinutes, 'number') + sField('Default hint penalty (minutes)', 'defaultHintPenaltyMinutes', s.defaultHintPenaltyMinutes, 'number') +
+        sField('Start countdown (seconds)', 'startCountdownSeconds', s.startCountdownSeconds, 'number') + '</section>' +
+        '<section class="panel"><h2>Homerooms and Falcon teams</h2><p class="muted">These are set in content.js on GitHub. ' + G.homerooms.filter(h => h.room !== 'P').length + ' homerooms on ' + G.teams.length + ' teams.</p></section>' +
+        '<section class="panel"><h2>Backup file</h2><p class="muted">Your edits are saved in Firebase. content.js on GitHub is the backup a computer uses if it can\'t load them. After your final edits, download a fresh copy and upload it to GitHub to replace the old one.</p>' +
+        '<div class="row-btns"><button class="btn primary" data-export2>Download content.js</button><button class="btn danger" data-restore>Undo all edits (go back to content.js)</button></div></section></div>';
+      $$('[data-s]').forEach(inp => inp.addEventListener('input', () => {
+        const k = inp.dataset.s, v = inp.type === 'number' ? (inp.value === '' ? '' : Number(inp.value)) : inp.value.trim();
+        if (k.startsWith('pins.')) { if (!v) return; s.pins[k.slice(5)] = v; } else { if (v === '') return; s[k] = v; }
+        save();
+      }));
+      $('[data-export2]').onclick = exportFile;
+      $('[data-restore]').onclick = async () => {
+        if (!await confirmBox({ title: 'Undo all edits?', text: 'Every step, codeword, hint and setting goes back to what\'s in content.js on GitHub. This can\'t be undone.', ok: 'Undo all edits', danger: true })) return;
+        clearTimeout(saveTimer);
+        CDB.remove('content');
+        draft = baseDraft(); sel = 0; saveState = 'saved'; drawStatus(); drawTab();
+      };
+    }
+    function sField(label, key, val, type) {
+      return '<div class="bld-field"><label for="s-' + key + '">' + esc(label) + '</label><input id="s-' + key + '" type="' + (type || 'text') + '" data-s="' + key + '" value="' + esc(val) + '"' + (type === 'number' ? ' min="0" step="0.5"' : '') + '></div>';
+    }
+  }
+
+  /* =====================================================================
      BOOT
      ===================================================================== */
-  let DB;
+  let DB, CDB;
   function fatal(title, msg) {
     $('#app').innerHTML = '<div class="center-screen"><div class="fatal stack"><h1>' + esc(title) + '</h1><p>' + msg + '</p><button class="btn primary big" onclick="location.reload()">Reload the page</button></div></div>';
   }
-  if (!G || !Array.isArray(G.steps)) return fatal('Content didn\'t load', 'The file content.js is missing or has a typo. Check it and reload.');
+  if (!BASE || !Array.isArray(BASE.steps)) return fatal('Content didn\'t load', 'The file content.js is missing or has a typo. Check it and reload.');
   const hasConfig = !!(window.FIREBASE_CONFIG && window.FIREBASE_CONFIG.databaseURL);
   if (hasConfig) {
     if (!window.firebase || !firebase.database) return fatal('Can\'t reach the game server', 'Firebase didn\'t load on this computer. Check the internet connection, then reload. If it keeps happening, the school web filter may be blocking gstatic.com or firebaseio.com.');
-    try { DB = makeFirebaseDB(); } catch (e) { console.error(e); return fatal('Can\'t start the game server', 'The Firebase settings in firebase-config.js look wrong.'); }
-  } else DB = makeLocalDB();
+    try {
+      CDB = makeFirebaseDB(CONTENT_ROOT);
+      DB = PREVIEW ? makeLocalDB(ROOT) : makeFirebaseDB(ROOT);
+    } catch (e) { console.error(e); return fatal('Can\'t start the game server', 'The Firebase settings in firebase-config.js look wrong.'); }
+  } else { CDB = makeLocalDB(CONTENT_ROOT); DB = makeLocalDB(ROOT); }
 
-  const route = location.hash.replace('#', '').toLowerCase();
-  modeBanner();
-  if (route === 'control') pinGate('ff-cpin', G.pins.control, 'Control panel', controlApp);
-  else if (route === 'library') pinGate('ff-lpin', G.pins.library, 'Library check-in', libraryApp);
-  else if (route === 'board') boardApp();
-  else teacherApp();
+  // Start from the last content this computer saw (or content.js), then sync.
+  applyContent(buildGame(normalizeContent(store.get('ff-content-cache'))));
+  $('#app').innerHTML = '<div class="center-screen"><p class="muted">Loading the mission files…</p></div>';
+  new Promise(res => {
+    let first = true;
+    const t = setTimeout(() => { if (first) { first = false; res(); } }, 5000);
+    CDB.on('content', v => {
+      if (v) store.set('ff-content-cache', v); else store.del('ff-content-cache');
+      const g = buildGame(normalizeContent(v));
+      if (contentFrozen) pendingContent = g;
+      else { applyContent(g); contentListeners.forEach(fn => fn()); }
+      if (first) { first = false; clearTimeout(t); res(); }
+    });
+  }).then(() => {
+    const route = location.hash.replace('#', '').toLowerCase();
+    modeBanner();
+    if (route === 'control') pinGate('ff-cpin', G.pins.control, 'Control panel', controlApp);
+    else if (route === 'builder') pinGate('ff-cpin', G.pins.control, 'Game builder', builderApp);
+    else if (route === 'library') pinGate('ff-lpin', G.pins.library, 'Library check-in', libraryApp);
+    else if (route === 'board') boardApp();
+    else if (PREVIEW) pinGate('ff-cpin', G.pins.control, 'Preview', teacherApp);
+    else teacherApp();
+  });
   window.addEventListener('hashchange', () => location.reload());
 })();
