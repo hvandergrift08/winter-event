@@ -25,10 +25,10 @@ window.GAME = {
   startCountdownSeconds: 10,      // countdown shown on every screen at start
 
   teams: [
-    { id: "lanner",    name: "Lanner Falcons",    color: "#5EC8FF" },
-    { id: "bat",       name: "Bat Falcons",       color: "#C59BFF" },
-    { id: "gyr",       name: "GyrFalcons",        color: "#F4C54A" },
-    { id: "peregrine", name: "Peregrine Falcons", color: "#5FE0A8" }
+    { id: "lanner",    name: "Lanner Falcons",    color: "#B98CFF" },
+    { id: "bat",       name: "Bat Falcons",       color: "#FF6B6B" },
+    { id: "gyr",       name: "GyrFalcons",        color: "#4ADE80" },
+    { id: "peregrine", name: "Peregrine Falcons", color: "#FACC15" }
   ],
 
   homerooms: [
